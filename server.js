@@ -59,6 +59,17 @@ const verifyToken = async (req, res, next) => {
 };
 
 // Routes
+app.get('/', (req, res) => {
+    res.json({
+        message: 'CV Builder API is running',
+        status: 'online',
+        endpoints: {
+            test: '/api/test',
+            cvs: '/api/cvs'
+        }
+    });
+});
+
 app.get('/api/test', (req, res) => {
     res.send('Backend is working');
 });
