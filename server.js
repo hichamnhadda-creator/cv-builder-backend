@@ -36,7 +36,7 @@ const supabase = createClient(
     process.env.SUPABASE_ANON_KEY
 );
 
-// Lemon Squeezy Configuration (Removed)
+
 
 const isProduction = process.env.NODE_ENV === 'production';
 
@@ -191,21 +191,29 @@ app.get('/api/profile', verifyToken, async (req, res) => {
 app.post('/api/payment/create-order', verifyToken, async (req, res) => {
     try {
         const { packId } = req.body;
-        // Packs: pack_40=30MAD, pack_100=60MAD, pack_200=100MAD
-        let value = '0.00';
-        if (packId === 'pack_40') value = '3.00'; // ~$3.00 USD
-        else if (packId === 'pack_100') value = '6.00';
-        else if (packId === 'pack_200') value = '10.00';
-        else return res.status(400).json({ error: 'Invalid pack ID' });
+        
+        // Define price mapping (USD) - DO NOT trust frontend price
+        const packPricing = {
+            'pack_40': { price: '3.00', credits: 40 },
+            'pack_100': { price: '6.00', credits: 100 },
+            'pack_200': { price: '10.00', credits: 200 }
+        };
+
+        const selectedPack = packPricing[packId];
+        if (!selectedPack) {
+            return res.status(400).json({ error: 'Invalid pack ID' });
+        }
 
         const request = new checkoutNodeJssdk.orders.OrdersCreateRequest();
         request.prefer("return=representation");
         request.requestBody({
             intent: 'CAPTURE',
             purchase_units: [{
+                description: `Credit Pack: ${selectedPack.credits} credits`,
+                custom_id: packId, // Store packId for capture reference
                 amount: {
                     currency_code: 'USD',
-                    value: value
+                    value: selectedPack.price
                 }
             }]
         });
@@ -214,55 +222,92 @@ app.post('/api/payment/create-order', verifyToken, async (req, res) => {
         res.json({ id: order.result.id });
     } catch (err) {
         console.error('PayPal Create Order Error:', err);
-        res.status(500).json({ error: 'Failed to create order' });
+        res.status(500).json({ error: 'Failed to create PayPal order' });
     }
 });
 
 app.post('/api/payment/capture-order', verifyToken, async (req, res) => {
     try {
-        const { orderID, packId } = req.body;
+        const { orderID } = req.body;
+        
+        if (!orderID) {
+            return res.status(400).json({ error: 'Order ID is required' });
+        }
+
         const request = new checkoutNodeJssdk.orders.OrdersCaptureRequest(orderID);
         request.requestBody({});
         const capture = await paypalClient.execute(request);
 
         if (capture.result.status === 'COMPLETED') {
-            let creditsToAdd = 0;
-            if (packId === 'pack_40') creditsToAdd = 40;
-            else if (packId === 'pack_100') creditsToAdd = 100;
-            else if (packId === 'pack_200') creditsToAdd = 200;
+            // Get the pack details from capture result or body (trusting capture result metadata if possible)
+            // For simplicity and safety, we can pass packId in body too, but we validate it.
+            const { packId } = req.body;
+            
+            const packPricing = {
+                'pack_40': { credits: 40, mad: 30 },
+                'pack_100': { credits: 100, mad: 60 },
+                'pack_200': { credits: 200, mad: 100 }
+            };
 
-            // Fetch current profile
-            const { data: profile } = await supabase
+            const pack = packPricing[packId];
+            if (!pack) {
+                console.error(`Unexpected packId ${packId} for order ${orderID}`);
+                return res.status(400).json({ error: 'Invalid pack configuration' });
+            }
+
+            // 1. Fetch current credits
+            const { data: profile, error: profileError } = await supabase
                 .from('profiles')
                 .select('credits')
                 .eq('id', req.user.id)
                 .single();
 
-            const currentCredits = profile?.credits || 0;
+            if (profileError) throw profileError;
 
-            // Update credits
-            await supabase
+            const newCredits = (profile?.credits || 0) + pack.credits;
+
+            // 2. Update user credits in profiles
+            const { error: updateError } = await supabase
                 .from('profiles')
-                .update({ credits: currentCredits + creditsToAdd })
+                .update({ credits: newCredits })
                 .eq('id', req.user.id);
 
-            // Log transaction
-            await supabase.from('transactions').insert([{
-                user_id: req.user.id,
-                paypal_order_id: orderID,
-                amount_mad: packId === 'pack_100' ? 60 : packId === 'pack_200' ? 100 : 30,
-                credits_added: creditsToAdd
-            }]);
+            if (updateError) throw updateError;
 
-            res.json({ success: true, newCredits: currentCredits + creditsToAdd });
+            // 3. Log the transaction
+            const { error: transError } = await supabase
+                .from('transactions')
+                .insert([{
+                    user_id: req.user.id,
+                    paypal_order_id: orderID,
+                    amount_mad: pack.mad,
+                    credits_added: pack.credits,
+                    status: 'completed',
+                    payment_method: 'paypal',
+                    currency: 'USD',
+                    amount_paid: capture.result.purchase_units[0].payments.captures[0].amount.value
+                }]);
+
+            if (transError) {
+                console.error('Transaction logging failed but payment was captured:', transError);
+                // We don't fail here because the user already paid and credits were added.
+            }
+
+            res.json({ 
+                success: true, 
+                newCredits: newCredits,
+                transactionId: orderID
+            });
         } else {
-            res.status(400).json({ error: 'Payment capture not completed' });
+            console.warn(`Payment capture status: ${capture.result.status}`);
+            res.status(400).json({ error: `Payment not completed: ${capture.result.status}` });
         }
     } catch (err) {
         console.error('PayPal Capture Error:', err);
-        res.status(500).json({ error: 'Failed to capture payment' });
+        res.status(500).json({ error: 'Failed to capture PayPal payment' });
     }
 });
+
 
 // Deduct Credit Endpoint for exporting CV
 app.post('/api/cvs/deduct-credit', verifyToken, async (req, res) => {
