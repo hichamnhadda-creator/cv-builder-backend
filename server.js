@@ -13,6 +13,12 @@ if (nodeEnv === 'production' && !process.env.SUPABASE_URL) {
     dotenv.config({ path: path.resolve(process.cwd(), '.env') });
 }
 
+// Log loaded environment for debugging
+console.log(`[Config] Environment: ${nodeEnv}`);
+console.log(`[Config] Supabase URL: ${process.env.SUPABASE_URL ? 'Loaded' : 'MISSING'}`);
+console.log(`[Config] Supabase Key: ${process.env.SUPABASE_ANON_KEY ? 'Loaded' : 'MISSING'}`);
+console.log(`[Config] Frontend URL: ${process.env.FRONTEND_URL || 'Not Set (allowing all via CORS reflect)'}`);
+
 const crypto = require('crypto');
 const helmet = require('helmet');
 const compression = require('compression');
@@ -40,7 +46,16 @@ const supabase = createClient(
 
 const isProduction = process.env.NODE_ENV === 'production';
 
-app.use(cors({ origin: '*', credentials: true }));
+app.use(cors({
+    origin: function (origin, callback) {
+        // Allow requests with no origin (like mobile apps or curl)
+        if (!origin) return callback(null, true);
+        // In production, we could restrict to specific domains, 
+        // but for now we reflect the origin to satisfy credentials: true
+        callback(null, origin);
+    },
+    credentials: true
+}));
 app.use(express.json());
 
 // Auth Middleware
