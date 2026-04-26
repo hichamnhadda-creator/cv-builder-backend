@@ -36,11 +36,16 @@ app.use(helmet()); // Set security-related HTTP headers
 app.use(compression()); // Compress all responses
 const PORT = process.env.PORT || 5000;
 
-// Initialize Supabase client
+// Initialize Supabase client with SERVICE_ROLE_KEY for administrative access
 const supabase = createClient(
     process.env.SUPABASE_URL,
-    process.env.SUPABASE_ANON_KEY
+    process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY // Fallback to anon key if service role is missing (though not recommended)
 );
+
+if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    console.warn('[Warning] SUPABASE_SERVICE_ROLE_KEY is missing. Backend may be restricted by RLS.');
+}
+
 
 
 
@@ -71,16 +76,18 @@ const verifyToken = async (req, res, next) => {
         const { data: { user }, error } = await supabase.auth.getUser(token);
 
         if (error || !user) {
-            return res.status(401).json({ error: 'Invalid token' });
+            console.error('[Auth] Token verification failed:', error?.message);
+            return res.status(401).json({ error: 'Invalid or expired token' });
         }
 
         req.user = user;
         next();
     } catch (err) {
-        console.error('Token verification error:', err);
-        return res.status(401).json({ error: 'Token verification failed' });
+        console.error('[Auth] Internal verification error:', err.message);
+        return res.status(401).json({ error: 'Authentication failed' });
     }
 };
+
 
 // Routes
 app.get('/', (req, res) => {
