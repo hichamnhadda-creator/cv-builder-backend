@@ -240,26 +240,40 @@ app.delete('/api/cvs/:id', verifyToken, async (req, res) => {
 // Profile endpoints
 app.get('/api/profile', verifyToken, async (req, res) => {
     try {
-        const { data: profile, error } = await supabase
+        let { data: profile, error } = await supabase
             .from('profiles')
             .select('credits')
             .eq('id', req.user.id)
             .single();
 
         if (error) {
-            console.error(`[Profile] Fetch error for user ${req.user.id}:`, error.message);
-            throw error;
+            // PGRST116 means 0 rows returned - user exists in Auth but not in Profiles table
+            if (error.code === 'PGRST116') {
+                console.warn(`[Profile] No profile record found for user ${req.user.id}. Using defaults.`);
+                profile = { credits: 0 };
+            } else {
+                console.error(`[Profile] Fetch error for user ${req.user.id}:`, error.message);
+                throw error;
+            }
         }
         
         // Determine if user has purchased anything before
-        const { count } = await supabase
+        const { count, error: transError } = await supabase
             .from('transactions')
             .select('*', { count: 'exact', head: true })
             .eq('user_id', req.user.id);
             
-        console.log(`[Profile] Fetched profile for ${req.user.email}. Credits: ${profile.credits}, Purchased: ${count > 0}`);
-        res.json({ ...profile, has_purchased: count > 0 });
+        if (transError) {
+            console.error(`[Profile] Transaction count error for ${req.user.id}:`, transError.message);
+        }
+            
+        console.log(`[Profile] Fetched profile for ${req.user.email}. Credits: ${profile?.credits || 0}, Purchased: ${count > 0}`);
+        res.json({ 
+            credits: profile?.credits || 0, 
+            has_purchased: (count || 0) > 0 
+        });
     } catch (error) {
+        console.error('[Profile] Final catch block:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
