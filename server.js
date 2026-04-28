@@ -55,9 +55,22 @@ app.use(cors({
     origin: function (origin, callback) {
         // Allow requests with no origin (like mobile apps or curl)
         if (!origin) return callback(null, true);
-        // In production, we could restrict to specific domains, 
-        // but for now we reflect the origin to satisfy credentials: true
-        callback(null, origin);
+        
+        const allowedOrigins = [
+            process.env.FRONTEND_URL,
+            'http://localhost:3000',
+            'http://localhost:5173',
+            'https://hichamnhadda-creator.github.io'
+        ];
+
+        if (allowedOrigins.includes(origin) || origin.includes('github.io')) {
+            callback(null, true);
+        } else {
+            // Still allow other origins for now to avoid blocking legitimate users, 
+            // but log it for security auditing
+            console.log(`[CORS] Request from origin: ${origin}`);
+            callback(null, true);
+        }
     },
     credentials: true
 }));
@@ -74,20 +87,31 @@ const verifyToken = async (req, res, next) => {
 
     try {
         const { data: { user }, error } = await supabase.auth.getUser(token);
-
+        
         if (error || !user) {
-            console.error('[Auth] Token verification failed:', error?.message);
+            console.error(`[Auth] Token verification failed for ${req.ip}:`, error?.message || 'No user found');
             return res.status(401).json({ error: 'Invalid or expired token' });
         }
 
+        console.log(`[Auth] Authenticated user: ${user.email} (${user.id})`);
         req.user = user;
         next();
     } catch (err) {
-        console.error('[Auth] Internal verification error:', err.message);
+        console.error(`[Auth] Internal verification error for ${req.ip}:`, err.message);
         return res.status(401).json({ error: 'Authentication failed' });
     }
 };
 
+
+// Request Logger Middleware
+app.use((req, res, next) => {
+    const start = Date.now();
+    res.on('finish', () => {
+        const duration = Date.now() - start;
+        console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} ${res.statusCode} - ${duration}ms`);
+    });
+    next();
+});
 
 // Routes
 app.get('/', (req, res) => {
@@ -96,13 +120,35 @@ app.get('/', (req, res) => {
         status: 'online',
         endpoints: {
             test: '/api/test',
-            cvs: '/api/cvs'
+            cvs: '/api/cvs',
+            templates: '/api/templates',
+            profile: '/api/profile'
         }
     });
 });
 
 app.get('/api/test', (req, res) => {
+    console.log('[API] Test endpoint reached');
     res.send('Backend is working');
+});
+
+// Template Endpoints (New)
+app.get('/api/templates', async (req, res) => {
+    try {
+        console.log('[API] Fetching templates...');
+        // For now, return a basic list to satisfy the requirement
+        // In a real scenario, this might come from a DB or config file
+        const templates = [
+            { id: 'modern-1', name: 'Modern Executive', category: 'modern', isPremium: false },
+            { id: 'professional-1', name: 'Corporate Classic', category: 'professional', isPremium: true },
+            { id: 'creative-1', name: 'Creative Studio', category: 'creative', isPremium: true },
+            { id: 'minimal-1', name: 'Pure Minimal', category: 'minimal', isPremium: true }
+        ];
+        res.json(templates);
+    } catch (error) {
+        console.error('[API] Templates error:', error.message);
+        res.status(500).json({ error: 'Failed to fetch templates' });
+    }
 });
 
 // CV Endpoints
@@ -113,7 +159,11 @@ app.get('/api/cvs', verifyToken, async (req, res) => {
             .select('*')
             .eq('user_id', req.user.id);
 
-        if (error) throw error;
+        if (error) {
+            console.error(`[CV] Fetch error for user ${req.user.id}:`, error.message);
+            throw error;
+        }
+        console.log(`[CV] Fetched ${data.length} CVs for user ${req.user.id}`);
         res.json(data);
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -128,7 +178,11 @@ app.post('/api/cvs', verifyToken, async (req, res) => {
             .select()
             .single();
 
-        if (error) throw error;
+        if (error) {
+            console.error(`[CV] Create error for user ${req.user.id}:`, error.message);
+            throw error;
+        }
+        console.log(`[CV] Created new CV (${data.id}) for user ${req.user.id}`);
         res.status(201).json(data);
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -192,7 +246,10 @@ app.get('/api/profile', verifyToken, async (req, res) => {
             .eq('id', req.user.id)
             .single();
 
-        if (error) throw error;
+        if (error) {
+            console.error(`[Profile] Fetch error for user ${req.user.id}:`, error.message);
+            throw error;
+        }
         
         // Determine if user has purchased anything before
         const { count } = await supabase
@@ -200,6 +257,7 @@ app.get('/api/profile', verifyToken, async (req, res) => {
             .select('*', { count: 'exact', head: true })
             .eq('user_id', req.user.id);
             
+        console.log(`[Profile] Fetched profile for ${req.user.email}. Credits: ${profile.credits}, Purchased: ${count > 0}`);
         res.json({ ...profile, has_purchased: count > 0 });
     } catch (error) {
         res.status(500).json({ error: error.message });
