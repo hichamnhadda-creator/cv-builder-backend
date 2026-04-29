@@ -9,7 +9,6 @@
         "dev": "nodemon server.js"
     },
     "dependencies": {
-        "@paypal/checkout-server-sdk": "^1.0.3",
         "@supabase/supabase-js": "^2.43.1",
         "compression": "^1.8.1",
         "cors": "^2.8.5",
