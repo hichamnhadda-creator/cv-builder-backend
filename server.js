@@ -126,24 +126,65 @@ app.get('/api/test', (req, res) => {
     res.send('Backend is working');
 });
 
-// Template Endpoints (New)
+// Template Endpoints (Updated with full list or flag logic)
 app.get('/api/templates', async (req, res) => {
     try {
-        console.log('[API] Fetching templates...');
-        // For now, return a basic list to satisfy the requirement
-        // In a real scenario, this might come from a DB or config file
+        // Return minimal info for validation; frontend has the full data
         const templates = [
-            { id: 'modern-1', name: 'Modern Executive', category: 'modern', isPremium: false },
-            { id: 'professional-1', name: 'Corporate Classic', category: 'professional', isPremium: true },
-            { id: 'creative-1', name: 'Creative Studio', category: 'creative', isPremium: true },
-            { id: 'minimal-1', name: 'Pure Minimal', category: 'minimal', isPremium: true }
+            { id: 'modern-1', isPremium: false },
+            { id: 'professional-1', isPremium: false },
+            { id: 'creative-1', isPremium: false },
+            { id: 'minimal-1', isPremium: false },
+            { id: 'dark-1', isPremium: false },
+            // All others are considered premium by default in this simple logic
         ];
         res.json(templates);
     } catch (error) {
-        console.error('[API] Templates error:', error.message);
         res.status(500).json({ error: 'Failed to fetch templates' });
     }
 });
+
+// Helper to map frontend camelCase to database lowercase
+const mapToDB = (frontendCV, userId) => {
+    return {
+        id: frontendCV.id,
+        user_id: userId,
+        title: frontendCV.title,
+        templateid: frontendCV.templateId,
+        personalinfo: frontendCV.personalInfo,
+        experience: frontendCV.experience,
+        education: frontendCV.education,
+        diplomas: frontendCV.diplomas,
+        skills: frontendCV.skills,
+        languages: frontendCV.languages,
+        certifications: frontendCV.certifications,
+        projects: frontendCV.projects,
+        customization: frontendCV.customization,
+        createdat: frontendCV.createdAt || new Date().toISOString(),
+        updatedat: frontendCV.updatedAt || new Date().toISOString()
+    };
+};
+
+// Helper to map database lowercase to frontend camelCase
+const mapToFrontend = (dbCV) => {
+    if (!dbCV) return null;
+    return {
+        id: dbCV.id,
+        title: dbCV.title,
+        templateId: dbCV.templateid,
+        personalInfo: dbCV.personalinfo,
+        experience: dbCV.experience,
+        education: dbCV.education,
+        diplomas: dbCV.diplomas,
+        skills: dbCV.skills,
+        languages: dbCV.languages,
+        certifications: dbCV.certifications,
+        projects: dbCV.projects,
+        customization: dbCV.customization,
+        createdAt: dbCV.createdat,
+        updatedAt: dbCV.updatedat
+    };
+};
 
 // CV Endpoints
 app.get('/api/cvs', verifyToken, async (req, res) => {
@@ -158,7 +199,7 @@ app.get('/api/cvs', verifyToken, async (req, res) => {
             throw error;
         }
         console.log(`[CV] Fetched ${data.length} CVs for user ${req.user.id}`);
-        res.json(data);
+        res.json(data.map(mapToFrontend));
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -166,9 +207,10 @@ app.get('/api/cvs', verifyToken, async (req, res) => {
 
 app.post('/api/cvs', verifyToken, async (req, res) => {
     try {
+        const dbPayload = mapToDB(req.body, req.user.id);
         const { data, error } = await supabase
             .from('cvs')
-            .insert([{ ...req.body, user_id: req.user.id }])
+            .insert([dbPayload])
             .select()
             .single();
 
@@ -177,7 +219,7 @@ app.post('/api/cvs', verifyToken, async (req, res) => {
             throw error;
         }
         console.log(`[CV] Created new CV (${data.id}) for user ${req.user.id}`);
-        res.status(201).json(data);
+        res.status(201).json(mapToFrontend(data));
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -193,7 +235,7 @@ app.get('/api/cvs/:id', verifyToken, async (req, res) => {
             .single();
 
         if (error) throw error;
-        res.json(data);
+        res.json(mapToFrontend(data));
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -201,17 +243,24 @@ app.get('/api/cvs/:id', verifyToken, async (req, res) => {
 
 app.put('/api/cvs/:id', verifyToken, async (req, res) => {
     try {
+        console.log(`[CV] Save request for CV ${req.params.id} by user ${req.user.id}`);
+        const dbPayload = mapToDB(req.body, req.user.id);
+        
+        // Use upsert so that if the CV was created offline/locally, it still saves successfully
         const { data, error } = await supabase
             .from('cvs')
-            .update(req.body)
-            .eq('id', req.params.id)
-            .eq('user_id', req.user.id)
+            .upsert(dbPayload)
             .select()
             .single();
 
-        if (error) throw error;
-        res.json(data);
+        if (error) {
+            console.error(`[CV] Save error for ${req.params.id}:`, error.message);
+            throw error;
+        }
+        console.log(`[CV] Successfully saved CV ${req.params.id}`);
+        res.json(mapToFrontend(data));
     } catch (error) {
+        console.error(`[CV] PUT endpoint catch:`, error.message);
         res.status(500).json({ error: error.message });
     }
 });
@@ -234,6 +283,7 @@ app.delete('/api/cvs/:id', verifyToken, async (req, res) => {
 // Profile endpoints
 app.get('/api/profile', verifyToken, async (req, res) => {
     try {
+        console.log(`[Profile] Fetching for user: ${req.user.id} (${req.user.email})`);
         let { data: profile, error } = await supabase
             .from('profiles')
             .select('credits')
@@ -261,7 +311,7 @@ app.get('/api/profile', verifyToken, async (req, res) => {
             console.error(`[Profile] Transaction count error for ${req.user.id}:`, transError.message);
         }
             
-        console.log(`[Profile] Fetched profile for ${req.user.email}. Credits: ${profile?.credits || 0}, Purchased: ${count > 0}`);
+        console.log(`[Profile] RESPONSE for ${req.user.email}: Credits=${profile?.credits || 0}, Purchased=${(count || 0) > 0}`);
         res.json({ 
             credits: profile?.credits || 0, 
             has_purchased: (count || 0) > 0 
@@ -272,41 +322,143 @@ app.get('/api/profile', verifyToken, async (req, res) => {
     }
 });
 
-// Secure endpoint to increment local testing only (if ever needed)
-// app.post('/api/credits/add', verifyToken, async(req, res) => { ... })
+// Secure endpoint to add credits after purchase
+app.post('/api/credits/add', verifyToken, async (req, res) => {
+    try {
+        const { credits, packId, transactionId } = req.body;
+        console.log(`[Credits] ADD request for user ${req.user.id}. Amount: ${credits}, Pack: ${packId}`);
+
+        if (!credits || credits <= 0) {
+            return res.status(400).json({ error: 'Invalid credit amount' });
+        }
+
+        // 1. Get current balance
+        const { data: profile, error: fetchError } = await supabase
+            .from('profiles')
+            .select('credits')
+            .eq('id', req.user.id)
+            .single();
+            
+        let currentCredits = 0;
+        if (!fetchError) {
+            currentCredits = Number(profile?.credits || 0);
+        } else if (fetchError.code !== 'PGRST116') {
+            console.error(`[Credits] Fetch before add failed:`, fetchError.message);
+            throw fetchError;
+        }
+
+        const newBalance = currentCredits + credits;
+        console.log(`[Credits] UPDATING balance for ${req.user.id}: ${currentCredits} -> ${newBalance}`);
+
+        // 2. Update profile (upsert ensures it works even if no profile existed)
+        const { data: updatedProfile, error: updateError } = await supabase
+            .from('profiles')
+            .upsert({ 
+                id: req.user.id, 
+                credits: newBalance,
+                updated_at: new Date().toISOString()
+            })
+            .select('credits')
+            .single();
+
+        if (updateError) {
+            console.error(`[Credits] Update failed:`, updateError.message);
+            throw updateError;
+        }
+
+        // 3. Record transaction
+        const { error: transError } = await supabase
+            .from('transactions')
+            .insert([{
+                user_id: req.user.id,
+                credits_added: credits,
+                amount_mad: 0, // In mock we don't have price here, but could pass it
+                status: 'completed',
+                payment_method: 'mock_card',
+                paypal_order_id: transactionId || 'internal_' + Date.now()
+            }]);
+
+        if (transError) {
+            console.warn(`[Credits] Transaction record failed (non-critical):`, transError.message);
+        }
+
+        console.log(`[Credits] SUCCESS. New balance for ${req.user.id}: ${updatedProfile.credits}`);
+        res.json({ success: true, credits: updatedProfile.credits });
+    } catch (err) {
+        console.error('[Credits] ADD ERROR:', err);
+        res.status(500).json({ error: 'Failed to add credits' });
+    }
+});
 
 
 // Deduct Credit Endpoint for exporting CV
 app.post('/api/cvs/deduct-credit', verifyToken, async (req, res) => {
     try {
-        const cost = 5;
-        const { data: profile } = await supabase
+        const { templateId } = req.body;
+        
+        console.log('\n=== EXPORT PDF REQUEST ===');
+        console.log(`[Export] Incoming Auth Header:`, req.headers.authorization ? `${req.headers.authorization.substring(0, 20)}...` : 'Missing');
+        console.log(`[Export] Decoded User ID:`, req.user?.id);
+        console.log(`[Export] Decoded User Email:`, req.user?.email);
+        console.log(`[Credits] DEDUCT request for template: ${templateId}`);
+
+        // Define free templates (should match frontend templateData.js)
+        const freeTemplates = ['modern-1', 'professional-1', 'creative-1', 'minimal-1', 'dark-1'];
+        
+        if (freeTemplates.includes(templateId)) {
+            console.log(`[Credits] Template ${templateId} is FREE. Bypassing deduction.`);
+            return res.json({ success: true, message: 'Free template - no credits required' });
+        }
+
+        const { data: profile, error: profileError } = await supabase
             .from('profiles')
             .select('credits')
             .eq('id', req.user.id)
             .single();
             
-        const currentCredits = profile?.credits || 0;
+        if (profileError) {
+            if (profileError.code === 'PGRST116') {
+                console.warn(`[Credits] No profile found for user ${req.user.id}. Defaulting to 0.`);
+                profile = { credits: 0 };
+            } else {
+                console.error(`[Credits] Database error for user ${req.user.id}:`, profileError.message);
+                return res.status(500).json({ error: 'Failed to retrieve user profile' });
+            }
+        }
+            
+        const cost = 5;
+        // Parse credits as a number to prevent string comparison bugs
+        const currentCredits = Number(profile?.credits || 0);
+        
+        console.log(`[Credits] VALIDATION - User: ${req.user.id}, DB Credits: ${profile?.credits}, Parsed Current: ${currentCredits}, Required: ${cost}`);
         
         if (currentCredits < cost) {
-            return res.status(403).json({ error: 'Not enough credits' });
+            console.error(`[Export 403 Reason] Insufficient credits. DB shows ${currentCredits}, but ${cost} is required.`);
+            console.warn(`[Credits] INSUFFICIENT for user ${req.user.id}: ${currentCredits} < ${cost}`);
+            return res.status(403).json({ error: `Not enough credits (Available: ${currentCredits}, Required: ${cost})` });
         }
         
-        const { data, error } = await supabase
+        const newBalance = currentCredits - cost;
+        const { data: updatedProfile, error: updateError } = await supabase
             .from('profiles')
-            .update({ credits: currentCredits - cost })
+            .update({ credits: newBalance })
             .eq('id', req.user.id)
             .select('credits')
             .single();
             
-        if (error) throw error;
+        if (updateError) {
+            console.error(`[Credits] DEDUCT failed for user ${req.user.id}:`, updateError.message);
+            throw updateError;
+        }
         
-        res.json({ success: true, remainingCredits: data.credits });
+        console.log(`[Credits] DEDUCT SUCCESS - User: ${req.user.id}, New Balance: ${updatedProfile.credits}`);
+        res.json({ success: true, remainingCredits: updatedProfile.credits });
     } catch (err) {
-        console.error('Deduct Credit Error:', err);
+        console.error('[Credits] DEDUCT ERROR:', err);
         res.status(500).json({ error: 'Failed to deduct credits' });
     }
 });
+
 
 // Global Error Handler
 app.use((err, req, res, next) => {
