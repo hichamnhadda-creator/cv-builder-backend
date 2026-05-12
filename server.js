@@ -67,8 +67,8 @@ app.use(cors({
     },
     credentials: true
 }));
-app.use(express.json({ limit: '5mb' }));
-app.use(express.urlencoded({ limit: '5mb', extended: true }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // Auth Middleware
 const verifyToken = async (req, res, next) => {
@@ -88,6 +88,20 @@ const verifyToken = async (req, res, next) => {
         }
 
         console.log(`[Auth] Authenticated user: ${user.email} (${user.id})`);
+        
+        // Create a scoped Supabase client with the user's token to bypass any RLS anon blocks
+        req.supabase = createClient(
+            process.env.SUPABASE_URL,
+            process.env.SUPABASE_ANON_KEY,
+            {
+                global: {
+                    headers: {
+                        Authorization: `Bearer ${token}`
+                    }
+                }
+            }
+        );
+
         req.user = user;
         next();
     } catch (err) {
@@ -189,7 +203,7 @@ const mapToFrontend = (dbCV) => {
 // CV Endpoints
 app.get('/api/cvs', verifyToken, async (req, res) => {
     try {
-        const { data, error } = await supabase
+        const { data, error } = await req.supabase
             .from('cvs')
             .select('*')
             .eq('user_id', req.user.id);
@@ -208,7 +222,7 @@ app.get('/api/cvs', verifyToken, async (req, res) => {
 app.post('/api/cvs', verifyToken, async (req, res) => {
     try {
         const dbPayload = mapToDB(req.body, req.user.id);
-        const { data, error } = await supabase
+        const { data, error } = await req.supabase
             .from('cvs')
             .insert([dbPayload])
             .select()
@@ -227,7 +241,7 @@ app.post('/api/cvs', verifyToken, async (req, res) => {
 
 app.get('/api/cvs/:id', verifyToken, async (req, res) => {
     try {
-        const { data, error } = await supabase
+        const { data, error } = await req.supabase
             .from('cvs')
             .select('*')
             .eq('id', req.params.id)
@@ -247,7 +261,7 @@ app.put('/api/cvs/:id', verifyToken, async (req, res) => {
         const dbPayload = mapToDB(req.body, req.user.id);
         
         // Use upsert so that if the CV was created offline/locally, it still saves successfully
-        const { data, error } = await supabase
+        const { data, error } = await req.supabase
             .from('cvs')
             .upsert(dbPayload)
             .select()
@@ -267,7 +281,7 @@ app.put('/api/cvs/:id', verifyToken, async (req, res) => {
 
 app.delete('/api/cvs/:id', verifyToken, async (req, res) => {
     try {
-        const { error } = await supabase
+        const { error } = await req.supabase
             .from('cvs')
             .delete()
             .eq('id', req.params.id)
@@ -284,7 +298,7 @@ app.delete('/api/cvs/:id', verifyToken, async (req, res) => {
 app.get('/api/profile', verifyToken, async (req, res) => {
     try {
         console.log(`[Profile] Fetching for user: ${req.user.id} (${req.user.email})`);
-        let { data: profile, error } = await supabase
+        let { data: profile, error } = await req.supabase
             .from('profiles')
             .select('credits')
             .eq('id', req.user.id)
@@ -302,7 +316,7 @@ app.get('/api/profile', verifyToken, async (req, res) => {
         }
         
         // Determine if user has purchased anything before
-        const { count, error: transError } = await supabase
+        const { count, error: transError } = await req.supabase
             .from('transactions')
             .select('*', { count: 'exact', head: true })
             .eq('user_id', req.user.id);
@@ -333,7 +347,7 @@ app.post('/api/credits/add', verifyToken, async (req, res) => {
         }
 
         // 1. Get current balance
-        const { data: profile, error: fetchError } = await supabase
+        const { data: profile, error: fetchError } = await req.supabase
             .from('profiles')
             .select('credits')
             .eq('id', req.user.id)
@@ -351,7 +365,7 @@ app.post('/api/credits/add', verifyToken, async (req, res) => {
         console.log(`[Credits] UPDATING balance for ${req.user.id}: ${currentCredits} -> ${newBalance}`);
 
         // 2. Update profile (upsert ensures it works even if no profile existed)
-        const { data: updatedProfile, error: updateError } = await supabase
+        const { data: updatedProfile, error: updateError } = await req.supabase
             .from('profiles')
             .upsert({ 
                 id: req.user.id, 
@@ -367,7 +381,7 @@ app.post('/api/credits/add', verifyToken, async (req, res) => {
         }
 
         // 3. Record transaction
-        const { error: transError } = await supabase
+        const { error: transError } = await req.supabase
             .from('transactions')
             .insert([{
                 user_id: req.user.id,
@@ -410,7 +424,7 @@ app.post('/api/cvs/deduct-credit', verifyToken, async (req, res) => {
             return res.json({ success: true, message: 'Free template - no credits required' });
         }
 
-        const { data: profile, error: profileError } = await supabase
+        let { data: profile, error: profileError } = await req.supabase
             .from('profiles')
             .select('credits')
             .eq('id', req.user.id)
@@ -439,7 +453,7 @@ app.post('/api/cvs/deduct-credit', verifyToken, async (req, res) => {
         }
         
         const newBalance = currentCredits - cost;
-        const { data: updatedProfile, error: updateError } = await supabase
+        const { data: updatedProfile, error: updateError } = await req.supabase
             .from('profiles')
             .update({ credits: newBalance })
             .eq('id', req.user.id)
