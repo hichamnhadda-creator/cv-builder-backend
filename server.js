@@ -23,6 +23,23 @@ const crypto = require('crypto');
 const helmet = require('helmet');
 const compression = require('compression');
 const { createClient } = require('@supabase/supabase-js');
+const multer = require('multer');
+const pdfParse = require('pdf-parse');
+const mammoth = require('mammoth');
+const { GoogleGenAI } = require('@google/genai');
+const { Paddle, Environment } = require('@paddle/paddle-node-sdk');
+
+// Initialize Paddle
+const paddle = new Paddle({
+    apiKey: process.env.PADDLE_API_KEY,
+    environment: process.env.PADDLE_ENV === 'production' ? Environment.Production : Environment.Sandbox,
+});
+
+// Configure multer for memory storage
+const upload = multer({ 
+    storage: multer.memoryStorage()
+    // fileSize limit removed as requested
+});
 
 const app = express();
 app.use(helmet()); // Set security-related HTTP headers
@@ -67,6 +84,82 @@ app.use(cors({
     },
     credentials: true
 }));
+// Paddle Webhook (Needs raw body for signature verification)
+app.post('/api/webhooks/paddle', express.text({ type: 'application/json' }), async (req, res) => {
+    const signature = req.headers['paddle-signature'] || '';
+    const secret = process.env.PADDLE_WEBHOOK_SECRET || '';
+
+    try {
+        if (!signature || !secret) {
+            console.error('[Paddle Webhook] Missing signature or secret');
+            return res.status(400).send('Missing signature or secret');
+        }
+
+        const eventData = paddle.webhooks.unmarshal(req.body, secret, signature);
+        console.log(`[Paddle Webhook] Received event: ${eventData.eventType}`);
+
+        if (eventData.eventType === 'transaction.completed') {
+            const transaction = eventData.data;
+            // Get user_id and credits from custom_data
+            const userId = transaction.customData?.user_id;
+            const creditsStr = transaction.customData?.credits;
+            const credits = parseInt(creditsStr || '0');
+
+            if (userId && credits > 0) {
+                console.log(`[Paddle Webhook] Processing ${credits} credits for user ${userId}`);
+                
+                // 1. Get current balance using ADMIN client
+                const { data: profile } = await supabase
+                    .from('profiles')
+                    .select('credits')
+                    .eq('id', userId)
+                    .single();
+                
+                const currentCredits = Number(profile?.credits || 0);
+                const newBalance = currentCredits + credits;
+
+                // 2. Update profile
+                const { error: updateError } = await supabase
+                    .from('profiles')
+                    .upsert({ 
+                        id: userId, 
+                        credits: newBalance,
+                        updated_at: new Date().toISOString()
+                    });
+
+                if (updateError) {
+                    console.error(`[Paddle Webhook] Profile update error:`, updateError.message);
+                    throw updateError;
+                }
+
+                // 3. Record transaction
+                const { error: transError } = await supabase
+                    .from('transactions')
+                    .insert([{
+                        user_id: userId,
+                        paddle_transaction_id: transaction.id,
+                        amount_paid: parseFloat(transaction.details?.totals?.total || '0') / 100, // Paddle returns cents
+                        currency: transaction.currencyCode,
+                        credits_added: credits,
+                        status: 'completed',
+                        payment_method: 'paddle'
+                    }]);
+
+                if (transError) {
+                    console.warn(`[Paddle Webhook] Transaction record error:`, transError.message);
+                }
+
+                console.log(`[Paddle Webhook] SUCCESS. User ${userId} new balance: ${newBalance}`);
+            }
+        }
+        
+        res.status(200).send('Webhook processed');
+    } catch (err) {
+        console.error(`[Paddle Webhook] Verification failed:`, err.message);
+        res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+});
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
@@ -200,6 +293,39 @@ const mapToFrontend = (dbCV) => {
     };
 };
 
+const FREE_TEMPLATES = [
+    'modern-1'
+];
+
+/**
+ * Server-side validation for template access
+ */
+const checkTemplateAccess = async (supabase, userId, templateId) => {
+    const cleanId = templateId?.trim()?.toLowerCase();
+    if (FREE_TEMPLATES.includes(cleanId)) return true;
+
+    // Check if user is premium (has credits or transactions)
+    const { data: profile } = await supabase
+        .from('profiles')
+        .select('credits')
+        .eq('id', userId)
+        .single();
+    
+    const { count } = await supabase
+        .from('transactions')
+        .select('*', { count: 'exact', head: true })
+        .eq('user_id', userId);
+
+    const credits = profile?.credits || 0;
+    const transactions = count || 0;
+
+    const isPremium = credits > 0 || transactions > 0;
+    
+    console.log(`[Backend Access Check] User: ${userId}, Template: ${cleanId}, Credits: ${credits}, Transactions: ${transactions}, Result: ${isPremium ? 'ALLOWED' : 'DENIED'}`);
+
+    return isPremium;
+};
+
 // CV Endpoints
 app.get('/api/cvs', verifyToken, async (req, res) => {
     try {
@@ -221,6 +347,18 @@ app.get('/api/cvs', verifyToken, async (req, res) => {
 
 app.post('/api/cvs', verifyToken, async (req, res) => {
     try {
+        const { templateId } = req.body;
+        
+        // 1. Verify template access
+        const canAccess = await checkTemplateAccess(req.supabase, req.user.id, templateId);
+        if (!canAccess) {
+            console.warn(`[CV] Access Denied: Free user ${req.user.id} tried to create CV with premium template ${templateId}`);
+            return res.status(403).json({ 
+                error: 'Premium template access denied. Please upgrade your plan.',
+                premiumRequired: true 
+            });
+        }
+
         const dbPayload = mapToDB(req.body, req.user.id);
         const { data, error } = await req.supabase
             .from('cvs')
@@ -249,7 +387,20 @@ app.get('/api/cvs/:id', verifyToken, async (req, res) => {
             .single();
 
         if (error) throw error;
-        res.json(mapToFrontend(data));
+        
+        const frontendCV = mapToFrontend(data);
+        
+        // Verify template access for existing CV
+        const canAccess = await checkTemplateAccess(req.supabase, req.user.id, frontendCV.templateId);
+        if (!canAccess) {
+            console.warn(`[CV] Access Denied: Free user ${req.user.id} tried to open CV ${req.params.id} with premium template ${frontendCV.templateId}`);
+            return res.status(403).json({ 
+                error: 'Premium template access denied. Please upgrade your plan.',
+                premiumRequired: true 
+            });
+        }
+
+        res.json(frontendCV);
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -258,6 +409,19 @@ app.get('/api/cvs/:id', verifyToken, async (req, res) => {
 app.put('/api/cvs/:id', verifyToken, async (req, res) => {
     try {
         console.log(`[CV] Save request for CV ${req.params.id} by user ${req.user.id}`);
+        
+        const { templateId } = req.body;
+        
+        // 1. Verify template access before saving/updating
+        const canAccess = await checkTemplateAccess(req.supabase, req.user.id, templateId);
+        if (!canAccess) {
+            console.warn(`[CV] Access Denied: Free user ${req.user.id} tried to save CV with premium template ${templateId}`);
+            return res.status(403).json({ 
+                error: 'Premium template access denied. Please upgrade your plan.',
+                premiumRequired: true 
+            });
+        }
+
         const dbPayload = mapToDB(req.body, req.user.id);
         
         // Use upsert so that if the CV was created offline/locally, it still saves successfully
@@ -294,115 +458,197 @@ app.delete('/api/cvs/:id', verifyToken, async (req, res) => {
     }
 });
 
-// Profile endpoints
-app.get('/api/profile', verifyToken, async (req, res) => {
+// Import CV Endpoint
+app.post('/api/cvs/import', verifyToken, upload.single('file'), async (req, res) => {
     try {
-        console.log(`[Profile] Fetching for user: ${req.user.id} (${req.user.email})`);
-        let { data: profile, error } = await req.supabase
+        console.log(`[Import CV] Request from user: ${req.user.id}`);
+        
+        // 1. Verify premium status
+        const { data: profile } = await req.supabase
             .from('profiles')
             .select('credits')
             .eq('id', req.user.id)
             .single();
+            
+        const { count, error: transError } = await req.supabase
+            .from('transactions')
+            .select('*', { count: 'exact', head: true })
+            .eq('user_id', req.user.id);
+            
+        const currentCredits = profile?.credits || 0;
+        
+        if (transError || ((count || 0) === 0 && currentCredits <= 0)) {
+            console.warn(`[Import CV] Access denied: User ${req.user.id} has no transactions and no credits.`);
+            return res.status(403).json({ error: 'Premium feature. Please purchase a credit pack to use CV Import.' });
+        }
+
+        // 2. Validate file
+        if (!req.file) {
+            return res.status(400).json({ error: 'No file uploaded' });
+        }
+
+        const ext = path.extname(req.file.originalname).toLowerCase();
+        let rawText = '';
+        let inlineData = null;
+
+        // 3. Extract Text or Prepare Inline Data
+        if (ext === '.pdf') {
+            try {
+                const pdfData = await pdfParse(req.file.buffer);
+                rawText = pdfData.text;
+            } catch (err) {
+                console.warn('[Import CV] pdf-parse failed:', err.message);
+            }
+            
+            // If text is too short (scanned PDF or image-based), send PDF directly to Gemini
+            if (!rawText || rawText.trim().length < 50) {
+                console.log('[Import CV] Insufficient text extracted. Sending PDF directly to Gemini for OCR.');
+                inlineData = {
+                    data: req.file.buffer.toString('base64'),
+                    mimeType: 'application/pdf'
+                };
+            }
+        } else if (ext === '.docx') {
+            const docxData = await mammoth.extractRawText({ buffer: req.file.buffer });
+            rawText = docxData.value;
+            
+            if (!rawText || rawText.trim().length < 50) {
+                return res.status(400).json({ error: 'Could not extract sufficient text from the DOCX file.' });
+            }
+        } else {
+            return res.status(400).json({ error: 'Unsupported file format. Please upload PDF or DOCX.' });
+        }
+
+        console.log(`[Import CV] Processing file. Sending to Gemini...`);
+
+        // 4. Parse with Gemini AI
+        if (!process.env.GEMINI_API_KEY) {
+            console.error('[Import CV] GEMINI_API_KEY is not configured in backend.');
+            return res.status(500).json({ error: 'AI Parsing is not configured on the server.' });
+        }
+
+        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+        
+        const systemPrompt = `You are an expert CV/Resume parser.
+Extract the details from the following resume text and format them EXACTLY into this JSON structure.
+Return ONLY valid JSON, without any markdown formatting or code blocks.
+
+{
+    "personalInfo": {
+        "fullName": "Extracted full name or empty string",
+        "email": "Extracted email or empty string",
+        "phone": "Extracted phone or empty string",
+        "address": "Extracted location/address or empty string",
+        "linkedin": "Extracted linkedin URL or empty string",
+        "website": "Extracted website URL or empty string",
+        "summary": "Extracted professional summary or about me section"
+    },
+    "experience": [
+        {
+            "id": "generate_a_random_string_id",
+            "company": "Company Name",
+            "position": "Job Title",
+            "startDate": "YYYY-MM",
+            "endDate": "YYYY-MM or Present",
+            "description": "Job responsibilities and achievements"
+        }
+    ],
+    "education": [
+        {
+            "id": "generate_a_random_string_id",
+            "school": "School/University Name",
+            "degree": "Degree Name",
+            "field": "Field of Study",
+            "startDate": "YYYY",
+            "endDate": "YYYY or Expected YYYY"
+        }
+    ],
+    "skills": ["Skill 1", "Skill 2"],
+    "languages": ["Language 1", "Language 2"]
+}
+
+Guidelines:
+- Guess the start and end dates based on context if not explicit.
+- Use empty strings or empty arrays if a section is not found.
+- Do NOT wrap the JSON in \`\`\`json blocks.
+`;
+
+        const contentsParts = [
+            systemPrompt,
+            inlineData ? { inlineData } : "\n\n--- RESUME TEXT ---\n" + rawText
+        ];
+
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: contentsParts
+        });
+
+        let jsonString = response.text;
+        
+        // Clean markdown blocks if Gemini returns them anyway
+        if (jsonString.startsWith('\`\`\`json')) {
+            jsonString = jsonString.replace(/^\`\`\`json/, '').replace(/\`\`\`$/, '').trim();
+        } else if (jsonString.startsWith('\`\`\`')) {
+            jsonString = jsonString.replace(/^\`\`\`/, '').replace(/\`\`\`$/, '').trim();
+        }
+
+        let parsedData;
+        try {
+            parsedData = JSON.parse(jsonString);
+        } catch (parseError) {
+            console.error('[Import CV] Failed to parse AI JSON response:', jsonString.substring(0, 200));
+            throw new Error('AI returned invalid JSON format');
+        }
+
+        console.log(`[Import CV] Successfully parsed CV data for user ${req.user.id}`);
+        res.json({ success: true, data: parsedData });
+
+    } catch (error) {
+        console.error(`[Import CV] Error:`, error.message);
+        res.status(500).json({ error: error.message || 'Failed to import CV' });
+    }
+});
+
+// Profile endpoints
+app.get('/api/profile', verifyToken, async (req, res) => {
+    try {
+        console.log(`[Profile] Fetching for user: ${req.user.id} (${req.user.email})`);
+        let { data: profile, error } = await supabase
+            .from('profiles')
+            .select('credits, free_export_count')
+            .eq('id', req.user.id)
+            .single();
 
         if (error) {
-            // PGRST116 means 0 rows returned - user exists in Auth but not in Profiles table
             if (error.code === 'PGRST116') {
                 console.warn(`[Profile] No profile record found for user ${req.user.id}. Using defaults.`);
-                profile = { credits: 0 };
+                profile = { credits: 0, free_export_count: 0 };
             } else {
                 console.error(`[Profile] Fetch error for user ${req.user.id}:`, error.message);
                 throw error;
             }
         }
         
-        // Determine if user has purchased anything before
-        const { count, error: transError } = await req.supabase
+        const { count, error: transError } = await supabase
             .from('transactions')
             .select('*', { count: 'exact', head: true })
             .eq('user_id', req.user.id);
             
-        if (transError) {
-            console.error(`[Profile] Transaction count error for ${req.user.id}:`, transError.message);
-        }
+        const currentCredits = Number(profile?.credits || 0);
+        const freeExportsUsed = Number(profile?.free_export_count || 0);
+        const hasPurchased = (count || 0) > 0 || currentCredits > 0;
             
-        console.log(`[Profile] RESPONSE for ${req.user.email}: Credits=${profile?.credits || 0}, Purchased=${(count || 0) > 0}`);
         res.json({ 
-            credits: profile?.credits || 0, 
-            has_purchased: (count || 0) > 0 
+            credits: currentCredits, 
+            free_export_count: freeExportsUsed,
+            has_purchased: hasPurchased 
         });
     } catch (error) {
-        console.error('[Profile] Final catch block:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Secure endpoint to add credits after purchase
-app.post('/api/credits/add', verifyToken, async (req, res) => {
-    try {
-        const { credits, packId, transactionId } = req.body;
-        console.log(`[Credits] ADD request for user ${req.user.id}. Amount: ${credits}, Pack: ${packId}`);
-
-        if (!credits || credits <= 0) {
-            return res.status(400).json({ error: 'Invalid credit amount' });
-        }
-
-        // 1. Get current balance
-        const { data: profile, error: fetchError } = await req.supabase
-            .from('profiles')
-            .select('credits')
-            .eq('id', req.user.id)
-            .single();
-            
-        let currentCredits = 0;
-        if (!fetchError) {
-            currentCredits = Number(profile?.credits || 0);
-        } else if (fetchError.code !== 'PGRST116') {
-            console.error(`[Credits] Fetch before add failed:`, fetchError.message);
-            throw fetchError;
-        }
-
-        const newBalance = currentCredits + credits;
-        console.log(`[Credits] UPDATING balance for ${req.user.id}: ${currentCredits} -> ${newBalance}`);
-
-        // 2. Update profile (upsert ensures it works even if no profile existed)
-        const { data: updatedProfile, error: updateError } = await req.supabase
-            .from('profiles')
-            .upsert({ 
-                id: req.user.id, 
-                credits: newBalance,
-                updated_at: new Date().toISOString()
-            })
-            .select('credits')
-            .single();
-
-        if (updateError) {
-            console.error(`[Credits] Update failed:`, updateError.message);
-            throw updateError;
-        }
-
-        // 3. Record transaction
-        const { error: transError } = await req.supabase
-            .from('transactions')
-            .insert([{
-                user_id: req.user.id,
-                credits_added: credits,
-                amount_mad: 0, // In mock we don't have price here, but could pass it
-                status: 'completed',
-                payment_method: 'mock_card',
-                paypal_order_id: transactionId || 'internal_' + Date.now()
-            }]);
-
-        if (transError) {
-            console.warn(`[Credits] Transaction record failed (non-critical):`, transError.message);
-        }
-
-        console.log(`[Credits] SUCCESS. New balance for ${req.user.id}: ${updatedProfile.credits}`);
-        res.json({ success: true, credits: updatedProfile.credits });
-    } catch (err) {
-        console.error('[Credits] ADD ERROR:', err);
-        res.status(500).json({ error: 'Failed to add credits' });
-    }
-});
+// Removed old insecure credit endpoint. Credits are now handled via Paddle Webhooks.
 
 
 // Deduct Credit Endpoint for exporting CV
@@ -410,50 +656,95 @@ app.post('/api/cvs/deduct-credit', verifyToken, async (req, res) => {
     try {
         const { templateId } = req.body;
         
-        console.log('\n=== EXPORT PDF REQUEST ===');
-        console.log(`[Export] Incoming Auth Header:`, req.headers.authorization ? `${req.headers.authorization.substring(0, 20)}...` : 'Missing');
-        console.log(`[Export] Decoded User ID:`, req.user?.id);
-        console.log(`[Export] Decoded User Email:`, req.user?.email);
-        console.log(`[Credits] DEDUCT request for template: ${templateId}`);
-
-        // Define free templates (should match frontend templateData.js)
-        const freeTemplates = ['modern-1', 'professional-1', 'creative-1', 'minimal-1', 'dark-1'];
+        // Case-insensitive template check
+        const cleanTemplateId = (templateId || '').trim().toLowerCase();
+        const isFreeTemplate = cleanTemplateId === 'modern-1';
         
-        if (freeTemplates.includes(templateId)) {
-            console.log(`[Credits] Template ${templateId} is FREE. Bypassing deduction.`);
-            return res.json({ success: true, message: 'Free template - no credits required' });
-        }
-
-        let { data: profile, error: profileError } = await req.supabase
+        // 1. Get user profile and transaction status using ADMIN client
+        const { data: profile, error: profileError } = await supabase
             .from('profiles')
-            .select('credits')
+            .select('credits, free_export_count')
             .eq('id', req.user.id)
             .single();
             
-        if (profileError) {
-            if (profileError.code === 'PGRST116') {
-                console.warn(`[Credits] No profile found for user ${req.user.id}. Defaulting to 0.`);
-                profile = { credits: 0 };
-            } else {
-                console.error(`[Credits] Database error for user ${req.user.id}:`, profileError.message);
-                return res.status(500).json({ error: 'Failed to retrieve user profile' });
-            }
-        }
-            
-        const cost = 5;
-        // Parse credits as a number to prevent string comparison bugs
+        const { count: transCount } = await supabase
+            .from('transactions')
+            .select('*', { count: 'exact', head: true })
+            .eq('user_id', req.user.id);
+
+        const currentFreeExports = Number(profile?.free_export_count || 0);
         const currentCredits = Number(profile?.credits || 0);
-        
-        console.log(`[Credits] VALIDATION - User: ${req.user.id}, DB Credits: ${profile?.credits}, Parsed Current: ${currentCredits}, Required: ${cost}`);
+        const isPremium = (transCount || 0) > 0 || currentCredits > 0;
+
+        console.log(`[Export Auth] User: ${req.user.id}, Template: ${cleanTemplateId}, FreeUsed: ${currentFreeExports}, isPremium: ${isPremium}`);
+
+        // 2. Handle Free Template Logic
+        if (isFreeTemplate) {
+            if (currentFreeExports >= 1 && !isPremium) {
+                console.warn(`[Export BLOCKED] Limit reached (1/1) for ${req.user.id}`);
+                return res.status(403).json({ 
+                    error: 'Free download limit reached. Please upgrade to Premium.',
+                    limitReached: true 
+                });
+            }
+
+            if (isPremium) {
+                return res.json({ success: true, message: 'Premium access' });
+            }
+
+            const nextCount = currentFreeExports + 1;
+            console.log(`[Export] Incrementing count to ${nextCount} for ${req.user.id}`);
+            
+            // Explicitly update using ADMIN client
+            const { data: updateData, error: updateError } = await supabase
+                .from('profiles')
+                .update({ 
+                    free_export_count: nextCount,
+                    updated_at: new Date().toISOString()
+                })
+                .eq('id', req.user.id)
+                .select();
+
+            if (updateError) {
+                console.error(`[Export] DB Update Error:`, updateError.message);
+                throw updateError;
+            }
+
+            // If no rows updated, the profile might be missing - try insert
+            if (!updateData || updateData.length === 0) {
+                console.log(`[Export] Profile missing, creating new record for ${req.user.id}`);
+                const { error: insertError } = await supabase
+                    .from('profiles')
+                    .insert({
+                        id: req.user.id,
+                        free_export_count: 1,
+                        credits: 0
+                    });
+                if (insertError) throw insertError;
+            }
+
+            console.log(`[Export] SUCCESS. New count: ${nextCount}`);
+
+            return res.json({ 
+                success: true, 
+                freeExportCount: nextCount 
+            });
+        }
+
+        // 3. Handle Premium Template Logic
+        const cost = 5;
+        console.log(`[Credits] VALIDATION - User: ${req.user.id}, DB Credits: ${currentCredits}, Required: ${cost}`);
         
         if (currentCredits < cost) {
-            console.error(`[Export 403 Reason] Insufficient credits. DB shows ${currentCredits}, but ${cost} is required.`);
-            console.warn(`[Credits] INSUFFICIENT for user ${req.user.id}: ${currentCredits} < ${cost}`);
-            return res.status(403).json({ error: `Not enough credits (Available: ${currentCredits}, Required: ${cost})` });
+            console.error(`[Export 403 Reason] Insufficient credits for premium template.`);
+            return res.status(403).json({ 
+                error: `Premium template requires 5 credits (Available: ${currentCredits}).`,
+                insufficientCredits: true
+            });
         }
         
         const newBalance = currentCredits - cost;
-        const { data: updatedProfile, error: updateError } = await req.supabase
+        const { data: updatedProfile, error: updateError } = await supabase
             .from('profiles')
             .update({ credits: newBalance })
             .eq('id', req.user.id)
@@ -469,12 +760,135 @@ app.post('/api/cvs/deduct-credit', verifyToken, async (req, res) => {
         res.json({ success: true, remainingCredits: updatedProfile.credits });
     } catch (err) {
         console.error('[Credits] DEDUCT ERROR:', err);
-        res.status(500).json({ error: 'Failed to deduct credits' });
+        res.status(500).json({ error: 'Failed to process export credit' });
     }
 });
 
 
-// Global Error Handler
+// --- COVER LETTER ENDPOINTS ---
+
+// Generate Cover Letter using AI
+app.post('/api/cover-letters/generate', verifyToken, async (req, res) => {
+    try {
+        const { cvData, company, jobTitle, language = 'en' } = req.body;
+
+        if (!cvData || !company || !jobTitle) {
+            return res.status(400).json({ error: 'Missing required data (CV data, company, or job title)' });
+        }
+
+        // 1. Premium Validation
+        const { data: profile } = await supabase
+            .from('profiles')
+            .select('credits')
+            .eq('id', req.user.id)
+            .single();
+            
+        const { count: transCount } = await supabase
+            .from('transactions')
+            .select('*', { count: 'exact', head: true })
+            .eq('user_id', req.user.id);
+
+        const currentCredits = Number(profile?.credits || 0);
+        const isPremium = (transCount || 0) > 0 || currentCredits >= 5;
+
+        if (!isPremium) {
+            return res.status(403).json({ 
+                error: 'Premium feature. Please purchase credits to generate cover letters.',
+                isPremium: false 
+            });
+        }
+
+        // 2. Generate Content with Gemini
+        const genAI = new GoogleGenAI(process.env.GEMINI_API_KEY);
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+
+        const prompt = `
+            You are a professional career coach and expert cover letter writer.
+            Using the provided CV data, write a high-quality, persuasive, and professional cover letter.
+            
+            TARGET JOB: ${jobTitle}
+            TARGET COMPANY: ${company}
+            LANGUAGE: ${language} (Write the entire letter in this language)
+            
+            CV DATA:
+            Name: ${cvData.personalInfo?.fullName}
+            Experience: ${JSON.stringify(cvData.experience)}
+            Skills: ${JSON.stringify(cvData.skills)}
+            Education: ${JSON.stringify(cvData.education)}
+            
+            Instructions:
+            - Write in a professional, engaging tone.
+            - Focus on how the candidate's skills and experience solve the company's needs.
+            - Include placeholders like [Date], [Hiring Manager Name] if not obvious.
+            - Format with proper paragraphs and professional structure.
+            - If language is Arabic, ensure formal Modern Standard Arabic.
+            - RETURN ONLY THE CONTENT OF THE LETTER. NO MARKDOWN, NO INTRO/OUTRO.
+        `;
+
+        const result = await model.generateContent(prompt);
+        const text = result.response.text().trim();
+
+        // 3. Deduct Credits (only if they aren't "unlimited" by large purchase, let's just deduct 5)
+        if (currentCredits >= 5) {
+            await supabase
+                .from('profiles')
+                .update({ credits: currentCredits - 5 })
+                .eq('id', req.user.id);
+        }
+
+        res.json({ 
+            success: true, 
+            content: text,
+            remainingCredits: currentCredits >= 5 ? currentCredits - 5 : currentCredits
+        });
+
+    } catch (error) {
+        console.error('[Cover Letter] Generation failed:', error);
+        res.status(500).json({ error: 'Failed to generate cover letter: ' + error.message });
+    }
+});
+
+// Save Cover Letter
+app.post('/api/cover-letters', verifyToken, async (req, res) => {
+    try {
+        const { title, company, jobTitle, content, language, cvId } = req.body;
+        
+        const { data, error } = await supabase
+            .from('cover_letters')
+            .insert([{
+                user_id: req.user.id,
+                title,
+                company,
+                job_title: jobTitle,
+                content,
+                language,
+                cv_id: cvId
+            }])
+            .select()
+            .single();
+
+        if (error) throw error;
+        res.json({ success: true, data });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get User's Cover Letters
+app.get('/api/cover-letters', verifyToken, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('cover_letters')
+            .select('*')
+            .eq('user_id', req.user.id)
+            .order('created_at', { ascending: false });
+
+        if (error) throw error;
+        res.json({ success: true, data });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
 app.use((err, req, res, next) => {
     console.error(`[Unhandled Error] ${err.message}`);
     res.status(err.status || 500).json({
