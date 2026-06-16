@@ -25,14 +25,16 @@ const compression = require('compression');
 const { createClient } = require('@supabase/supabase-js');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
+const rateLimit = require('express-rate-limit');
 const mammoth = require('mammoth');
 const { GoogleGenAI } = require('@google/genai');
-const { Paddle, Environment } = require('@paddle/paddle-node-sdk');
+const { Polar } = require('@polar-sh/sdk');
+const { Webhook } = require('standardwebhooks');
 
-// Initialize Paddle
-const paddle = new Paddle({
-    apiKey: process.env.PADDLE_API_KEY,
-    environment: process.env.PADDLE_ENV === 'production' ? Environment.Production : Environment.Sandbox,
+// Initialize Polar
+const polar = new Polar({
+    accessToken: process.env.POLAR_ACCESS_TOKEN,
+    server: process.env.NODE_ENV === 'production' ? 'production' : 'sandbox',
 });
 
 // Configure multer for memory storage
@@ -44,6 +46,27 @@ const upload = multer({
 const app = express();
 app.use(helmet()); // Set security-related HTTP headers
 app.use(compression()); // Compress all responses
+
+// Rate limiting configurations
+const generalLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 200, // Limit each IP to 200 requests per `window` (here, per 15 minutes)
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Trop de requêtes, veuillez réessayer plus tard.' }
+});
+
+const strictLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 20, // Limit each IP to 20 requests per hour for expensive operations
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Limite atteinte pour cette action, veuillez patienter.' }
+});
+
+// Apply general limiter to all API routes
+app.use('/api', generalLimiter);
+
 const PORT = process.env.PORT || 5000;
 
 // Initialize Supabase client with SERVICE_ROLE_KEY for administrative access
@@ -84,81 +107,208 @@ app.use(cors({
     },
     credentials: true
 }));
-// Paddle Webhook (Needs raw body for signature verification)
-app.post('/api/webhooks/paddle', express.text({ type: 'application/json' }), async (req, res) => {
-    const signature = req.headers['paddle-signature'] || '';
-    const secret = process.env.PADDLE_WEBHOOK_SECRET || '';
+// Polar Webhook (Needs raw body for signature verification)
+const handlePolarWebhook = async (req, res) => {
+    const secret = process.env.POLAR_WEBHOOK_SECRET || '';
+
+    console.log('[Polar Webhook] Received request...');
 
     try {
-        if (!signature || !secret) {
-            console.error('[Paddle Webhook] Missing signature or secret');
-            return res.status(400).send('Missing signature or secret');
+        if (!secret) {
+            console.error('[Polar Webhook] Missing webhook secret.');
+            return res.status(400).send('Missing secret');
         }
 
-        const eventData = paddle.webhooks.unmarshal(req.body, secret, signature);
-        console.log(`[Paddle Webhook] Received event: ${eventData.eventType}`);
+        const rawBody = typeof req.body === 'string' ? req.body : (Buffer.isBuffer(req.body) ? req.body.toString('utf8') : JSON.stringify(req.body));
+        
+        const fs = require('fs');
+        const logData = `\n--- Webhook Received ---\nHeaders: ${JSON.stringify(req.headers)}\nBody: ${rawBody}\n`;
+        fs.appendFileSync('webhook.log', logData);
 
-        if (eventData.eventType === 'transaction.completed') {
-            const transaction = eventData.data;
-            // Get user_id and credits from custom_data
-            const userId = transaction.customData?.user_id;
-            const creditsStr = transaction.customData?.credits;
-            const credits = parseInt(creditsStr || '0');
+        let eventData;
+        try {
+            const cleanSecret = secret.startsWith('polar_whs_') ? secret.replace('polar_whs_', 'whsec_') : secret;
+            const wh = new Webhook(cleanSecret);
+            eventData = wh.verify(rawBody, req.headers);
+        } catch (verifyError) {
+            console.error('[Polar Webhook] Signature verification failed:', verifyError.message);
+            fs.appendFileSync('webhook.log', `Verification Error: ${verifyError.message}\n`);
+            
+            // Allow bypass for local dev testing via smee because the secret often mismatches
+            if (process.env.NODE_ENV !== 'production' && req.headers['disguised-host'] === 'smee.io') {
+                 console.warn('[Polar Webhook] Bypassing signature check for local Smee testing!');
+                 eventData = JSON.parse(rawBody);
+            } else {
+                 return res.status(400).send('Invalid signature');
+            }
+        }
 
-            if (userId && credits > 0) {
-                console.log(`[Paddle Webhook] Processing ${credits} credits for user ${userId}`);
-                
-                // 1. Get current balance using ADMIN client
-                const { data: profile } = await supabase
+        console.log(`[Polar Webhook] Event verified successfully. Event Type: ${eventData.type}`);
+        fs.appendFileSync('webhook.log', `Verified Event Type: ${eventData.type}\n`);
+
+        if (['order.created', 'order.paid', 'checkout.completed'].includes(eventData.type)) {
+            const order = eventData.data;
+            const transactionId = order.id;
+
+            console.log(`[Polar Webhook] Processing event: ${eventData.type} for transaction: ${transactionId}`);
+
+            // 1. Strict Idempotency: Check if this transaction has already been processed
+            const { data: existingTx, error: txCheckError } = await supabase
+                .from('transactions')
+                .select('id')
+                .eq('polar_transaction_id', transactionId)
+                .maybeSingle();
+
+            if (existingTx) {
+                console.log(`[Polar Webhook] Transaction ${transactionId} already processed. Skipping to prevent duplicate credits.`);
+                return res.status(200).send('Webhook already processed (idempotent)');
+            }
+
+            // 2. Identify the target User
+            // IMPORTANT: Prioritize metadata because that is the actual logged-in user who initiated the checkout.
+            // If we only use customer.email, we might give credits to the wrong user if they used a different billing email!
+            let userEmail = order.metadata?.email || order.user?.email || order.customer?.email || order.customer_email;
+            let userId = order.metadata?.user_id || order.custom_field_data?.user_id || null;
+
+            if (!userId && userEmail) {
+                console.log(`[Polar Webhook] Attempting to find user by email: ${userEmail}`);
+                try {
+                    // Use listUsers to find the user by email since getUserByEmail is not supported in this version
+                    const { data: usersData, error: usersError } = await supabase.auth.admin.listUsers();
+                    if (!usersError && usersData?.users) {
+                        const foundUser = usersData.users.find(u => u.email.toLowerCase() === userEmail.toLowerCase());
+                        if (foundUser) {
+                            userId = foundUser.id;
+                            console.log(`[Polar Webhook] User found via listUsers: ${userId} (${userEmail})`);
+                        } else {
+                            console.log(`[Polar Webhook] User not found in listUsers for email: ${userEmail}`);
+                        }
+                    } else if (usersError) {
+                        console.error(`[Polar Webhook] Error fetching users list:`, usersError.message);
+                    }
+                } catch (err) {
+                    console.error(`[Polar Webhook] Exception during user lookup:`, err.message);
+                }
+            }
+
+            if (!userId) {
+                console.error(`[Polar Webhook] Critical: Could not identify target user for transaction ${transactionId} with email ${userEmail}`);
+                return res.status(400).send('Unable to identify user for credit assignment');
+            }
+
+            // Fetch current credits before update for detailed logging
+            const { data: profileBefore } = await supabase
+                .from('profiles')
+                .select('credits')
+                .eq('id', userId)
+                .single();
+            const creditsBefore = Number(profileBefore?.credits || 0);
+
+            // 3. Extract Credits from Product Metadata
+            const metadataCredits = order.product?.metadata?.credits || order.metadata?.credits;
+            let creditsToAdd = 0;
+
+            if (metadataCredits && parseInt(metadataCredits) > 0) {
+                creditsToAdd = parseInt(metadataCredits);
+                console.log(`[Polar Webhook] Extracted credits from product.metadata: ${creditsToAdd}`);
+            } else {
+                const productId = order.product_id;
+                const priceId = order.product_price_id;
+                if (productId === process.env.POLAR_PRODUCT_40_ID || priceId === process.env.POLAR_PRODUCT_40_ID) {
+                    creditsToAdd = 40;
+                } else if (productId === process.env.POLAR_PRODUCT_100_ID || priceId === process.env.POLAR_PRODUCT_100_ID) {
+                    creditsToAdd = 100;
+                } else if (productId === process.env.POLAR_PRODUCT_200_ID || priceId === process.env.POLAR_PRODUCT_200_ID) {
+                    creditsToAdd = 200;
+                } else if (order.amount) {
+                    // Fallback to extrapolate credits from amount paid to avoid 0 credits
+                    const amountInDollars = order.amount / 100;
+                    if (amountInDollars === 10 || amountInDollars === 60) creditsToAdd = 100; 
+                    else if (amountInDollars === 5 || amountInDollars === 30) creditsToAdd = 40;
+                    else if (amountInDollars === 18 || amountInDollars === 100) creditsToAdd = 200;
+                }
+                console.log(`[Polar Webhook] Fallback credits logic applied: ${creditsToAdd}`);
+            }
+
+            console.log(`[Polar Webhook] Credits to add: ${creditsToAdd}`);
+
+            if (creditsToAdd <= 0) {
+                console.warn(`[Polar Webhook] Transaction processed with 0 credits for user ${userId}.`);
+            } else {
+                console.log(`[Polar Webhook] Assigning +${creditsToAdd} credits to User ${userId}...`);
+
+                // 4. Secure & Atomic Credit Incrementation
+                const { error: rpcError } = await supabase.rpc('increment_credits', { 
+                    user_id: userId, 
+                    amount: creditsToAdd 
+                });
+
+                let dbUpdateResult = 'success';
+
+                if (rpcError) {
+                    console.warn(`[Polar Webhook] Atomic increment_credits RPC failed, executing safe fallback:`, rpcError.message);
+                    
+                    const newBalance = creditsBefore + creditsToAdd;
+
+                    const { error: updateError } = await supabase
+                        .from('profiles')
+                        .upsert({ 
+                            id: userId, 
+                            credits: newBalance,
+                            updated_at: new Date().toISOString()
+                        });
+
+                    if (updateError) {
+                        console.error(`[Polar Webhook] Fallback balance updates failed:`, updateError.message);
+                        dbUpdateResult = 'failed: ' + updateError.message;
+                        throw updateError;
+                    }
+                }
+
+                // Fetch credits after update
+                const { data: profileAfter } = await supabase
                     .from('profiles')
                     .select('credits')
                     .eq('id', userId)
                     .single();
+                const creditsAfter = Number(profileAfter?.credits || 0);
+                console.log(`[Polar Webhook] Credits after update: ${creditsAfter}`);
+                console.log(`[Polar Webhook] Database update result: ${dbUpdateResult}`);
+
+                // 5. Log transaction details in Supabase
+                const amountPaid = parseFloat(order.amount || '0') / 100;
+                const currency = order.currency || 'USD';
                 
-                const currentCredits = Number(profile?.credits || 0);
-                const newBalance = currentCredits + credits;
-
-                // 2. Update profile
-                const { error: updateError } = await supabase
-                    .from('profiles')
-                    .upsert({ 
-                        id: userId, 
-                        credits: newBalance,
-                        updated_at: new Date().toISOString()
-                    });
-
-                if (updateError) {
-                    console.error(`[Paddle Webhook] Profile update error:`, updateError.message);
-                    throw updateError;
-                }
-
-                // 3. Record transaction
                 const { error: transError } = await supabase
                     .from('transactions')
                     .insert([{
                         user_id: userId,
-                        paddle_transaction_id: transaction.id,
-                        amount_paid: parseFloat(transaction.details?.totals?.total || '0') / 100, // Paddle returns cents
-                        currency: transaction.currencyCode,
-                        credits_added: credits,
+                        polar_transaction_id: transactionId,
+                        amount_paid: amountPaid,
+                        currency: currency,
+                        credits_added: creditsToAdd,
                         status: 'completed',
-                        payment_method: 'paddle'
+                        payment_method: 'polar'
                     }]);
 
                 if (transError) {
-                    console.warn(`[Paddle Webhook] Transaction record error:`, transError.message);
+                    console.error(`[Polar Webhook] Failed to insert transaction record for ${transactionId}:`, transError.message);
                 }
 
-                console.log(`[Paddle Webhook] SUCCESS. User ${userId} new balance: ${newBalance}`);
+                console.log(`[Polar Webhook] SUCCESS. User ${userId} successfully credited with +${creditsToAdd} credits.`);
             }
+        } else {
+            console.log(`[Polar Webhook] Ignoring unhandled event type: ${eventData.type}`);
         }
-        
-        res.status(200).send('Webhook processed');
+
+        res.status(200).send('Webhook processed successfully');
     } catch (err) {
-        console.error(`[Paddle Webhook] Verification failed:`, err.message);
+        console.error(`[Polar Webhook] Error processing event:`, err.message);
         res.status(400).send(`Webhook Error: ${err.message}`);
     }
-});
+};
+
+app.post('/api/webhooks/polar', express.text({ type: 'application/json' }), handlePolarWebhook);
 
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
@@ -459,7 +609,7 @@ app.delete('/api/cvs/:id', verifyToken, async (req, res) => {
 });
 
 // Import CV Endpoint
-app.post('/api/cvs/import', verifyToken, upload.single('file'), async (req, res) => {
+app.post('/api/cvs/import', strictLimiter, verifyToken, upload.single('file'), async (req, res) => {
     try {
         console.log(`[Import CV] Request from user: ${req.user.id}`);
         
@@ -648,119 +798,148 @@ app.get('/api/profile', verifyToken, async (req, res) => {
     }
 });
 
-// Removed old insecure credit endpoint. Credits are now handled via Paddle Webhooks.
+// Removed old insecure credit endpoint. Credits are now handled via Polar Webhooks.
 
+// Create Polar Checkout Session Endpoint
+app.post('/api/payments/checkout', strictLimiter, verifyToken, async (req, res) => {
+    const { productId, credits } = req.body;
+    const user = req.user;
 
-// Deduct Credit Endpoint for exporting CV
-app.post('/api/cvs/deduct-credit', verifyToken, async (req, res) => {
+    if (!productId || !credits) {
+        return res.status(400).json({ error: 'Missing productId or credits' });
+    }
+
     try {
-        const { templateId } = req.body;
+        console.log(`[Polar Checkout] Creating session for product ${productId}, user ${user.email}`);
         
-        // Case-insensitive template check
-        const cleanTemplateId = (templateId || '').trim().toLowerCase();
-        const isFreeTemplate = cleanTemplateId === 'modern-1';
+        // Use FRONTEND_URL from environment or fallback to localhost:3000
+        const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+        const successUrl = `${frontendUrl}/pricing?payment=success`;
         
-        // 1. Get user profile and transaction status using ADMIN client
-        const { data: profile, error: profileError } = await supabase
-            .from('profiles')
-            .select('credits, free_export_count')
-            .eq('id', req.user.id)
-            .single();
-            
-        const { count: transCount } = await supabase
-            .from('transactions')
-            .select('*', { count: 'exact', head: true })
-            .eq('user_id', req.user.id);
+        // Use native fetch to bypass Polar SDK 0.11.1 typing limits on metadata
+        const polarBaseUrl = process.env.NODE_ENV === 'production' ? 'https://api.polar.sh' : 'https://sandbox-api.polar.sh';
+        const response = await fetch(`${polarBaseUrl}/v1/checkouts/`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${process.env.POLAR_ACCESS_TOKEN}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                product_price_id: productId,
+                success_url: successUrl,
+                customer_email: user.email,
+                metadata: {
+                    user_id: user.id,
+                    email: user.email,
+                    credits: credits.toString()
+                }
+            })
+        });
 
-        const currentFreeExports = Number(profile?.free_export_count || 0);
-        const currentCredits = Number(profile?.credits || 0);
-        const isPremium = (transCount || 0) > 0 || currentCredits > 0;
+        if (!response.ok) {
+            const errorData = await response.text();
+            throw new Error(`Polar API Error: ${errorData}`);
+        }
 
-        console.log(`[Export Auth] User: ${req.user.id}, Template: ${cleanTemplateId}, FreeUsed: ${currentFreeExports}, isPremium: ${isPremium}`);
+        const session = await response.json();
+        
+        console.log(`[Polar Checkout] Created session: ${session.url}`);
+        res.json({ url: session.url });
+    } catch (err) {
+        console.error('[Polar Checkout] Error creating session:', err.message);
+        res.status(500).json({ error: err.message || 'Failed to create checkout session' });
+    }
+});
 
-        // 2. Handle Free Template Logic
-        if (isFreeTemplate) {
-            if (currentFreeExports >= 1 && !isPremium) {
-                console.warn(`[Export BLOCKED] Limit reached (1/1) for ${req.user.id}`);
-                return res.status(403).json({ 
-                    error: 'Free download limit reached. Please upgrade to Premium.',
-                    limitReached: true 
+
+app.get('/api/packs', async (req, res) => {
+  try {
+    const packs = [
+      { id: 'pack_40', productPriceId: process.env.POLAR_PRODUCT_40_ID, credits: 40, price: 5 },
+      { id: 'pack_100', productPriceId: process.env.POLAR_PRODUCT_100_ID, credits: 100, price: 10 },
+      { id: 'pack_200', productPriceId: process.env.POLAR_PRODUCT_200_ID, credits: 200, price: 18 }
+    ];
+    res.json(packs);
+  } catch (error) {
+    console.error('[Packs] Error fetching pack list:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Deduct Credit Endpoint for exporting CV (Costs exactly 5 credits)
+app.post('/api/cvs/deduct-credit', verifyToken, async (req, res) => {
+    const userId = req.user.id;
+    const cost = 5;
+
+    console.log(`[Credits] Deduct request started for User ${userId}. Cost: ${cost} credits.`);
+
+    try {
+        // 1. Execute secure atomic PostgreSQL RPC function
+        const { data: newBalance, error: rpcError } = await supabase.rpc('deduct_credits', {
+            user_id: userId,
+            amount: cost
+        });
+
+        if (rpcError) {
+            // Handle insufficient credits exception raised by PostgreSQL function
+            if (rpcError.message && rpcError.message.includes('Insufficient credits')) {
+                console.warn(`[Credits] Insufficient credits RPC block for User ${userId}: ${rpcError.message}`);
+                return res.status(403).json({
+                    error: `Insufficient credits. Each CV export costs exactly 5 credits.`,
+                    insufficientCredits: true
                 });
             }
 
-            if (isPremium) {
-                return res.json({ success: true, message: 'Premium access' });
+            console.warn(`[Credits] deduct_credits RPC failed, initiating safe self-healing fallback:`, rpcError.message);
+
+            // 2. Self-Healing Fallback: Secure read-then-write logic
+            const { data: profile, error: readError } = await supabase
+                .from('profiles')
+                .select('credits')
+                .eq('id', userId)
+                .single();
+
+            if (readError) {
+                console.error(`[Credits] Fallback read profile failed for User ${userId}:`, readError.message);
+                throw readError;
             }
 
-            const nextCount = currentFreeExports + 1;
-            console.log(`[Export] Incrementing count to ${nextCount} for ${req.user.id}`);
-            
-            // Explicitly update using ADMIN client
-            const { data: updateData, error: updateError } = await supabase
+            const currentCredits = Number(profile?.credits || 0);
+            if (currentCredits < cost) {
+                console.warn(`[Credits] Insufficient credits fallback block for User ${userId} (Available: ${currentCredits})`);
+                return res.status(403).json({
+                    error: `Insufficient credits. Required: 5, Available: ${currentCredits}`,
+                    insufficientCredits: true
+                });
+            }
+
+            const computedBalance = currentCredits - cost;
+            const { data: updatedProfile, error: updateError } = await supabase
                 .from('profiles')
                 .update({ 
-                    free_export_count: nextCount,
+                    credits: computedBalance,
                     updated_at: new Date().toISOString()
                 })
-                .eq('id', req.user.id)
-                .select();
+                .eq('id', userId)
+                .select('credits')
+                .single();
 
             if (updateError) {
-                console.error(`[Export] DB Update Error:`, updateError.message);
+                console.error(`[Credits] Fallback update profile failed for User ${userId}:`, updateError.message);
                 throw updateError;
             }
 
-            // If no rows updated, the profile might be missing - try insert
-            if (!updateData || updateData.length === 0) {
-                console.log(`[Export] Profile missing, creating new record for ${req.user.id}`);
-                const { error: insertError } = await supabase
-                    .from('profiles')
-                    .insert({
-                        id: req.user.id,
-                        free_export_count: 1,
-                        credits: 0
-                    });
-                if (insertError) throw insertError;
-            }
-
-            console.log(`[Export] SUCCESS. New count: ${nextCount}`);
-
-            return res.json({ 
-                success: true, 
-                freeExportCount: nextCount 
-            });
+            console.log(`[Credits] Fallback DEDUCT SUCCESS - User: ${userId}, New Balance: ${updatedProfile.credits}`);
+            return res.json({ success: true, remainingCredits: updatedProfile.credits });
         }
 
-        // 3. Handle Premium Template Logic
-        const cost = 5;
-        console.log(`[Credits] VALIDATION - User: ${req.user.id}, DB Credits: ${currentCredits}, Required: ${cost}`);
-        
-        if (currentCredits < cost) {
-            console.error(`[Export 403 Reason] Insufficient credits for premium template.`);
-            return res.status(403).json({ 
-                error: `Premium template requires 5 credits (Available: ${currentCredits}).`,
-                insufficientCredits: true
-            });
-        }
-        
-        const newBalance = currentCredits - cost;
-        const { data: updatedProfile, error: updateError } = await supabase
-            .from('profiles')
-            .update({ credits: newBalance })
-            .eq('id', req.user.id)
-            .select('credits')
-            .single();
-            
-        if (updateError) {
-            console.error(`[Credits] DEDUCT failed for user ${req.user.id}:`, updateError.message);
-            throw updateError;
-        }
-        
-        console.log(`[Credits] DEDUCT SUCCESS - User: ${req.user.id}, New Balance: ${updatedProfile.credits}`);
-        res.json({ success: true, remainingCredits: updatedProfile.credits });
+        // Successfully executed PostgreSQL atomic deduct_credits RPC
+        console.log(`[Credits] Atomic RPC DEDUCT SUCCESS - User: ${userId}, New Balance: ${newBalance}`);
+        return res.json({ success: true, remainingCredits: newBalance });
+
     } catch (err) {
-        console.error('[Credits] DEDUCT ERROR:', err);
-        res.status(500).json({ error: 'Failed to process export credit' });
+        console.error('[Credits] Fatal error during credit deduction:', err.message);
+        res.status(500).json({ error: 'Failed to process export credit deduction' });
     }
 });
 
@@ -768,7 +947,7 @@ app.post('/api/cvs/deduct-credit', verifyToken, async (req, res) => {
 // --- COVER LETTER ENDPOINTS ---
 
 // Generate Cover Letter using AI
-app.post('/api/cover-letters/generate', verifyToken, async (req, res) => {
+app.post('/api/cover-letters/generate', strictLimiter, verifyToken, async (req, res) => {
     try {
         const { cvData, company, jobTitle, language = 'en' } = req.body;
 
@@ -802,13 +981,24 @@ app.post('/api/cover-letters/generate', verifyToken, async (req, res) => {
         const genAI = new GoogleGenAI(process.env.GEMINI_API_KEY);
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
+        const languageMap = {
+            'en': 'English',
+            'fr': 'French',
+            'ar': 'Arabic',
+            'es': 'Spanish',
+            'de': 'German',
+            'it': 'Italian',
+            'pt': 'Portuguese'
+        };
+        const fullLanguageName = languageMap[language] || 'English';
+
         const prompt = `
             You are a professional career coach and expert cover letter writer.
             Using the provided CV data, write a high-quality, persuasive, and professional cover letter.
             
             TARGET JOB: ${jobTitle}
             TARGET COMPANY: ${company}
-            LANGUAGE: ${language} (Write the entire letter in this language)
+            LANGUAGE: ${fullLanguageName} (CRITICAL: You MUST write the ENTIRE letter strictly in ${fullLanguageName}. Do not use English unless the requested language is English.)
             
             CV DATA:
             Name: ${cvData.personalInfo?.fullName}
@@ -882,6 +1072,48 @@ app.get('/api/cover-letters', verifyToken, async (req, res) => {
             .select('*')
             .eq('user_id', req.user.id)
             .order('created_at', { ascending: false });
+
+        if (error) throw error;
+        res.json({ success: true, data });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Delete Cover Letter
+app.delete('/api/cover-letters/:id', verifyToken, async (req, res) => {
+    try {
+        const { error } = await supabase
+            .from('cover_letters')
+            .delete()
+            .eq('id', req.params.id)
+            .eq('user_id', req.user.id);
+
+        if (error) throw error;
+        res.json({ success: true, message: 'Cover letter deleted successfully' });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Update Cover Letter
+app.put('/api/cover-letters/:id', verifyToken, async (req, res) => {
+    try {
+        const { title, company, jobTitle, content, language } = req.body;
+        const { data, error } = await supabase
+            .from('cover_letters')
+            .update({
+                title,
+                company,
+                job_title: jobTitle,
+                content,
+                language,
+                updated_at: new Date().toISOString()
+            })
+            .eq('id', req.params.id)
+            .eq('user_id', req.user.id)
+            .select()
+            .single();
 
         if (error) throw error;
         res.json({ success: true, data });
